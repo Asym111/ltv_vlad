@@ -1,0 +1,15 @@
+{
+  "name": "ltv-wa-service",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.0",
+    "express": "^4.18.2",
+    "https-proxy-agent": "^7.0.6",
+    "pino": "^8.17.2",
+    "qrcode": "^1.5.3"
+  }
+}

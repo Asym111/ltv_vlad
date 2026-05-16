@@ -1,0 +1,28 @@
+from fastapi import FastAPI
+
+from app.core.database import Base, engine
+from app import models  # noqa: F401
+from app.api import users_router, transactions_router
+from app.api.reports import router as reports_router
+from app.api.invites import router as invites_router
+from app.services.scheduler import start_scheduler
+
+app = FastAPI(title="LTV Loyalty Platform")
+
+start_scheduler()
+
+
+@app.on_event("startup")
+def on_startup():
+    Base.metadata.create_all(bind=engine)
+
+
+app.include_router(users_router)
+app.include_router(transactions_router)
+app.include_router(reports_router)
+app.include_router(invites_router)
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "app": "LTV Loyalty Platform"}

@@ -1,0 +1,405 @@
+# main.py
+import logging
+import os
+from datetime import datetime
+from urllib.parse import quote
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.responses import RedirectResponse, JSONResponse
+from collections import defaultdict
+import time
+
+import sentry_sdk
+
+# Audit log
+logging.basicConfig(level=logging.INFO)
+audit_logger = logging.getLogger("audit")
+audit_logger.setLevel(logging.INFO)
+
+# Простой in-memory rate limit для /auth (brute-force защита)
+_auth_attempts: dict = defaultdict(list)  # ip -> [timestamps]
+AUTH_RATE_LIMIT = 10   # попыток
+AUTH_RATE_WINDOW = 60  # секунд
+
+from app.core.database import engine, Base, SessionLocal
+
+from app.api.users import router as users_router
+from app.api.transactions import router as transactions_router
+from app.api.crm import router as crm_router
+from app.api.settings_api import router as settings_router
+from app.api.ai import router as ai_router
+from app.api.analytics import router as analytics_router
+from app.api.campaigns import router as campaigns_router
+from app.api.accounts_api import router as accounts_router
+from app.api.videos_api import router as videos_router
+from app.api.whatsapp import router as whatsapp_router
+from app.api.reports import router as reports_router
+from app.models.invites import router as invites_router
+
+from app.web.admin import router as admin_router
+from app.web.admin_campaigns import router as admin_campaigns_router
+from app.web.auth import router as auth_router
+from app.web.admin_accounts_web import router as admin_accounts_router
+from app.web.admin_videos_web import router as admin_videos_router
+from app.web.admin_whatsapp import router as admin_whatsapp_router  
+from app.web.superadmin import router as superadmin_router  
+
+from app.services.scheduler import start_scheduler
+
+# ✅ чтобы SQLAlchemy увидел модели
+import app.models  # noqa: F401
+import app.models.campaign  # noqa: F401
+import app.models.auth  # noqa: F401
+import app.models.invite  # noqa: F401
+
+from app.models.auth import AuthUser
+
+# ═══════════════════════════════════════════════════════════════
+# Запуск фоновых задач
+# ═══════════════════════════════════════════════════════════════
+start_scheduler()
+
+app = FastAPI(title="LTV Loyalty Platform")
+
+# -------------------------
+# Глобальная обработка ошибок (без трейсбека клиенту)
+# -------------------------
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=422,
+        content={"detail": "Validation error", "errors": exc.errors()},
+    )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    logger = logging.getLogger("LTV")
+    logger.error(f"Unhandled error: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error. Our team has been notified."},
+    )
+
+# -------------------------
+# Sentry
+# -------------------------
+def _is_prod() -> bool:
+    env = (os.getenv("ENV", "") or "").strip().lower()
+    return env in {"prod", "production"} or bool(os.getenv("RENDER"))
+
+IS_PROD = _is_prod()
+
+sentry_sdk.init(
+    dsn=os.getenv("SENTRY_DSN", ""),
+    environment=os.getenv("ENV", "development"),
+    traces_sample_rate=0.3 if IS_PROD else 1.0,
+)
+
+# -------------------------
+# CORS
+# -------------------------
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").strip()
+if ALLOWED_ORIGINS:
+    origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
+else:
+    origins = ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -------------------------
+# DB init
+# -------------------------
+Base.metadata.create_all(bind=engine)
+
+# -------------------------
+# Static
+# -------------------------
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+
+AUTH_REMEMBER_DAYS = _int_env("AUTH_REMEMBER_DAYS", 30)
+SESSION_SECRET = (os.getenv("SESSION_SECRET", "") or "").strip()
+
+COOKIE_SECURE = (os.getenv("COOKIE_SECURE", "1" if IS_PROD else "0") or ("1" if IS_PROD else "0")).strip() == "1"
+
+if IS_PROD:
+    weak_secrets = {"", "dev-secret-change-me", "change-me", "changeme"}
+    if SESSION_SECRET.strip().lower() in weak_secrets or len(SESSION_SECRET) < 32:
+        raise RuntimeError("Unsafe SESSION_SECRET for production. Set strong random secret (>=32 chars).")
+
+
+class AuthGuardMiddleware(BaseHTTPMiddleware):
+    # Страницы только для owner
+    OWNER_ONLY_PATHS = (
+        "/admin/settings",
+        "/admin/accounts",
+        "/api/settings",
+    )
+    # Страницы для admin + owner
+    ADMIN_PLUS_PATHS = (
+        "/admin/analytics",
+        "/admin/campaigns",
+        "/admin/whatsapp",
+        "/api/analytics",
+        "/api/campaigns",
+        "/api/whatsapp",
+        "/api/ai",
+    )
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+
+        docs_open = not IS_PROD
+        if (
+            path.startswith("/static")
+            or path.startswith("/dev")
+            or path in ("/auth", "/auth/", "/logout", "/logout/", "/health", "/favicon.ico")
+            or path.startswith("/superadmin")
+            or (docs_open and (path.startswith("/docs") or path.startswith("/openapi.json") or path.startswith("/redoc")))
+        ):
+            return await call_next(request)
+
+        if IS_PROD and (path.startswith("/docs") or path.startswith("/openapi.json") or path.startswith("/redoc")):
+            return JSONResponse({"detail": "Not found"}, status_code=404)
+
+        sess = request.session or {}
+        uid = sess.get("uid")
+
+        if uid:
+            request.state.user = {
+                "id":        sess.get("uid"),
+                "phone":     sess.get("phone"),
+                "name":      sess.get("name"),
+                "role":      sess.get("role"),
+                "tenant_id": sess.get("tenant_id"),
+            }
+        else:
+            request.state.user = None
+
+        # Обновление сессии при каждом запросе (refresh token)
+        if uid and sess.get("uid"):
+            try:
+                request.session["_last_activity"] = int(time.time())
+            except Exception:
+                pass
+
+        # Проверка session_version (logout из всех устройств)
+        if uid and sess.get("uid"):
+            try:
+                session_ver = sess.get("session_version")
+                if session_ver is not None:
+                    db = SessionLocal()
+                    try:
+                        user = db.query(AuthUser).filter(AuthUser.id == int(uid)).first()
+                        if user and user.session_version != session_ver:
+                            request.session.clear()
+                            if path.startswith("/api"):
+                                return JSONResponse({"detail": "Session expired. Please login again."}, status_code=401)
+                            return RedirectResponse(url="/auth?e=expired", status_code=303)
+                    finally:
+                        db.close()
+            except Exception:
+                pass
+
+        # Audit log — логирование доступа к данным
+        if path.startswith("/api") and uid:
+            try:
+                audit_logger.info(
+                    f"user_id={uid} role={sess.get('role')} tenant={sess.get('tenant_id')} "
+                    f"method={request.method} path={path} "
+                    f"ip={request.client.host if request.client else 'unknown'}"
+                )
+            except Exception:
+                pass
+
+        if path.startswith("/admin") or path.startswith("/api"):
+            if not uid:
+                if path.startswith("/api"):
+                    return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+                next_url = request.url.path
+                if request.url.query:
+                    next_url += "?" + request.url.query
+                return RedirectResponse(
+                    url=f"/auth?next={quote(next_url)}",
+                    status_code=303,
+                )
+
+            tenant_id = sess.get("tenant_id")
+            if tenant_id:
+                from app.models.auth import Tenant
+                db = SessionLocal()
+                try:
+                    t = db.query(Tenant).filter(Tenant.id == int(tenant_id)).first()
+                    if not t or not bool(getattr(t, "is_active", False)):
+                        request.session.clear()
+                        if path.startswith("/api"):
+                            return JSONResponse({"detail": "Account disabled"}, status_code=403)
+                        return RedirectResponse(
+                            url=f"/auth?next={quote('/admin')}&e=disabled",
+                            status_code=303,
+                        )
+
+                    access_until = getattr(t, "access_until", None)
+                    if access_until is not None and access_until < datetime.utcnow():
+                        request.session.clear()
+                        if path.startswith("/api"):
+                            return JSONResponse({"detail": "Subscription expired"}, status_code=402)
+                        next_url = request.url.path
+                        if request.url.query:
+                            next_url += "?" + request.url.query
+                        return RedirectResponse(
+                            url=f"/auth?next={quote(next_url)}&e=expired",
+                            status_code=303,
+                        )
+                finally:
+                    db.close()
+
+            role = str(sess.get("role") or "staff").lower()
+
+            if any(path.startswith(p) for p in self.OWNER_ONLY_PATHS):
+                if role != "owner":
+                    if path.startswith("/api"):
+                        return JSONResponse(
+                            {"detail": "Доступ запрещён. Требуется роль: owner"},
+                            status_code=403,
+                        )
+                    return RedirectResponse(url="/admin?e=forbidden", status_code=303)
+
+            if any(path.startswith(p) for p in self.ADMIN_PLUS_PATHS):
+                if role not in ("owner", "admin"):
+                    if path.startswith("/api"):
+                        return JSONResponse(
+                            {"detail": "Доступ запрещён. Требуется роль: admin или owner"},
+                            status_code=403,
+                        )
+                    return RedirectResponse(url="/admin?e=forbidden", status_code=303)
+
+        # CSRF защита для мутирующих запросов
+        if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            if path.startswith("/api"):
+                csrf_header = request.headers.get("X-CSRF-Token", "")
+                csrf_session = sess.get("csrf_token", "")
+                if not csrf_session or csrf_header != csrf_session:
+                    return JSONResponse({"detail": "CSRF token mismatch"}, status_code=403)
+
+        return await call_next(request)
+
+
+app.add_middleware(AuthGuardMiddleware)
+
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET or "dev-secret-change-me",
+    max_age=60 * 60 * 24 * AUTH_REMEMBER_DAYS,
+    same_site="lax",
+    https_only=COOKIE_SECURE,
+)
+
+
+@app.on_event("startup")
+def bootstrap_owner():
+    from app.models.auth import Tenant, AuthUser
+    from app.core.security import normalize_phone, hash_password
+
+    owner_phone = (os.getenv("OWNER_PHONE", "") or "").strip()
+    owner_password = (os.getenv("OWNER_PASSWORD", "") or "")
+    owner_name = (os.getenv("OWNER_NAME", "Owner") or "Owner").strip()
+
+    db = SessionLocal()
+    try:
+        existing = db.query(AuthUser).count()
+        if existing > 0:
+            print("[BOOTSTRAP] Users already exist. Skip owner create.")
+            return
+
+        if not owner_phone or not owner_password:
+            print("[BOOTSTRAP] No OWNER_PHONE/OWNER_PASSWORD. Owner not created.")
+            return
+
+        tenant = Tenant(name="Default account", is_active=True)
+        db.add(tenant)
+        db.flush()
+
+        salt, pw_hash = hash_password(owner_password)
+        user = AuthUser(
+            tenant_id=tenant.id,
+            phone=normalize_phone(owner_phone),
+            name=owner_name,
+            role="owner",
+            password_salt=salt,
+            password_hash=pw_hash,
+            is_active=True,
+        )
+        db.add(user)
+        db.commit()
+        print(f"[BOOTSTRAP] Owner created: {user.phone}")
+    finally:
+        db.close()
+
+
+app.include_router(users_router, prefix="/api")
+app.include_router(transactions_router, prefix="/api")
+app.include_router(crm_router, prefix="/api")
+app.include_router(settings_router, prefix="/api")
+app.include_router(ai_router, prefix="/api")
+app.include_router(analytics_router, prefix="/api")
+app.include_router(campaigns_router, prefix="/api")
+app.include_router(reports_router, prefix="/api")
+app.include_router(invites_router, prefix="/models")
+
+app.include_router(auth_router)
+app.include_router(admin_router)
+app.include_router(admin_campaigns_router)
+app.include_router(accounts_router, prefix="/api")
+app.include_router(admin_accounts_router)
+app.include_router(videos_router, prefix="/api")
+app.include_router(admin_videos_router)
+app.include_router(whatsapp_router, prefix="/api")
+app.include_router(admin_whatsapp_router)
+app.include_router(superadmin_router)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/")
+def root(request: Request):
+    if request.session.get("uid"):
+        return RedirectResponse("/admin", status_code=302)
+    return RedirectResponse("/auth", status_code=302)

@@ -1,0 +1,197 @@
+{% extends "base.html" %}
+
+{% set current_page = "desktop" %}
+{% set page_title = "Рабочий стол" %}
+{% set page_subtitle = "Главная панель управления" %}
+
+{% block topbar_actions %}
+<div class="d-flex gap-2 align-items-center">
+  <a class="btn btn-sm btn-outline-secondary" href="/admin/analytics">
+    <i class="bi bi-bar-chart me-1"></i> Аналитика
+  </a>
+  <a class="btn btn-sm btn-outline-secondary" href="/admin/campaigns">
+    <i class="bi bi-megaphone me-1"></i> Рекламные кампании
+  </a>
+  <button class="btn btn-sm btn-outline-secondary" type="button" id="dashReloadBtn">
+    <i class="bi bi-arrow-repeat me-1"></i> Обновить
+  </button>
+</div>
+{% endblock %}
+
+{% block content %}
+
+{% set role  = current_user.role if current_user else 'staff' %}
+{% set uname = current_user.name if current_user and current_user.name
+               else (current_user.phone if current_user else 'Сотрудник') %}
+
+{% if role == 'staff' %}
+<div class="row g-3">
+  <div class="col-12">
+    <div class="card p-3">
+      <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
+        <div>
+          <div class="text-muted small">Добро пожаловать</div>
+          <div class="h4 fw-black mb-0" id="staffGreeting">Добрый день, {{ uname }}!</div>
+          <div class="text-muted small mt-1" id="dashUpdatedAt">—</div>
+        </div>
+        <a class="btn btn-sm btn-success" href="/admin/transactions">
+          <i class="bi bi-plus-circle me-1"></i> Новая транзакция
+        </a>
+      </div>
+    </div>
+  </div>
+  <div class="col-12 col-md-6">
+    <div class="card p-3 h-100">
+      <div class="h6 mb-3 d-flex align-items-center gap-2">
+        <i class="bi bi-check2-square" style="color:var(--mint)"></i>
+        Мои задачи
+      </div>
+      <div id="staffTasksList" class="d-flex flex-column gap-2">
+        <div class="text-muted small">Загрузка…</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-12 col-md-6">
+    <div class="card p-3 h-100">
+      <div class="h6 mb-1">Сегодня</div>
+      <div class="text-muted small mb-3">Оперативные показатели за текущий день.</div>
+      <div class="dash-metrics">
+        <div class="dash-metric"><div class="label">Выручка</div><div class="value" id="dashTodayRevenue">—</div></div>
+        <div class="dash-metric"><div class="label">Транзакции</div><div class="value" id="dashTodayTx">—</div></div>
+        <div class="dash-metric"><div class="label">Ср. чек</div><div class="value" id="dashTodayAvg">—</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% else %}
+<div class="row g-3">
+
+  <div class="col-12">
+    <div class="card p-3">
+      <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
+        <div>
+          <div class="text-muted small">Добро пожаловать</div>
+          <div class="h4 fw-black mb-0">Добрый день, {{ uname }}!</div>
+          <div class="text-muted small mt-1" id="dashUpdatedAt">—</div>
+        </div>
+        <div class="d-flex gap-2 flex-wrap">
+          <a class="btn btn-sm btn-outline-secondary" href="/admin/clients"><i class="bi bi-people me-1"></i> Клиенты</a>
+          <a class="btn btn-sm btn-outline-secondary" href="/admin/transactions"><i class="bi bi-receipt me-1"></i> Транзакции</a>
+          <a class="btn btn-sm btn-success" href="/admin/campaigns"><i class="bi bi-megaphone me-1"></i> Рекламные кампании</a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-6 col-md-3">
+    <div class="kpi-card">
+      <div class="kpi-label">Выручка (30 дн)</div>
+      <div class="kpi-value" id="dashKpiRevenue30">—</div>
+      <div class="kpi-sub">₸</div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="kpi-card">
+      <div class="kpi-label">Транзакции (30 дн)</div>
+      <div class="kpi-value" id="dashKpiTx30">—</div>
+      <div class="kpi-sub">покупок</div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="kpi-card">
+      <div class="kpi-label">Средний чек (30 дн)</div>
+      <div class="kpi-value" id="dashKpiAvg30">—</div>
+      <div class="kpi-sub">₸</div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="kpi-card">
+      <div class="kpi-label">Новые клиенты</div>
+      <div class="kpi-value text-success" id="dashNewClients">—</div>
+      <div class="kpi-sub">за 30 дней</div>
+    </div>
+  </div>
+
+  <div class="col-12 col-lg-4">
+    <div class="card p-3 h-100">
+      <div class="d-flex align-items-center justify-content-between mb-3">
+        <div><div class="h6 mb-0">Сегодня</div><div class="text-muted small">Оперативные показатели.</div></div>
+        <a class="btn btn-sm btn-outline-secondary" href="/admin/transactions">Все <i class="bi bi-chevron-right ms-1"></i></a>
+      </div>
+      <div class="dash-metrics" style="grid-template-columns:repeat(3,1fr)">
+        <div class="dash-metric"><div class="label">Выручка</div><div class="value" id="dashTodayRevenue">—</div></div>
+        <div class="dash-metric"><div class="label">Транзакции</div><div class="value" id="dashTodayTx">—</div></div>
+        <div class="dash-metric"><div class="label">Ср. чек</div><div class="value" id="dashTodayAvg">—</div></div>
+      </div>
+      <hr class="my-3"/>
+      <div class="text-muted small mb-2">Последние транзакции</div>
+      <div class="dash-list" id="dashRecentTxList"><div class="text-muted small">Загрузка…</div></div>
+    </div>
+  </div>
+
+  <div class="col-12 col-lg-8">
+    <div class="card p-3 h-100">
+      <div class="d-flex align-items-center justify-content-between mb-3 flex-wrap gap-2">
+        <div><div class="h6 mb-0">Лента событий</div><div class="text-muted small">Начисления, списания и алерты за сегодня.</div></div>
+        <div class="d-flex gap-1 flex-wrap">
+          <button class="btn-xs feed-filter-btn active" data-type="">Все</button>
+          <button class="btn-xs feed-filter-btn" data-type="earn">Начисления</button>
+          <button class="btn-xs feed-filter-btn" data-type="redeem">Списания</button>
+          <button class="btn-xs feed-filter-btn" data-type="alert">Алерты</button>
+        </div>
+      </div>
+      <div id="dashFeedList" class="d-flex flex-column gap-2 dash-scroll" style="max-height:320px">
+        <div class="text-muted small">Загрузка…</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-12 col-lg-6">
+    <div class="card p-3">
+      <div class="d-flex align-items-center justify-content-between mb-3">
+        <div><div class="h6 mb-0">Рекламные кампании</div><div class="text-muted small">Последние кампании.</div></div>
+        <a class="btn btn-sm btn-outline-secondary" href="/admin/campaigns">Все <i class="bi bi-chevron-right ms-1"></i></a>
+      </div>
+      <div class="dash-list" id="dashCampaignList"><div class="text-muted small">Загрузка…</div></div>
+    </div>
+  </div>
+
+  <div class="col-12 col-lg-6">
+    <div class="card p-3">
+      <div class="d-flex align-items-center justify-content-between mb-3">
+        <div><div class="h6 mb-0">Задачи команде</div><div class="text-muted small">Ставьте задачи сотрудникам.</div></div>
+        <button class="btn btn-sm btn-success" type="button" id="taskAddBtn">
+          <i class="bi bi-plus-circle me-1"></i> Добавить
+        </button>
+      </div>
+      <div id="taskAddForm" class="d-none mb-3 p-3 rounded-3" style="background:color-mix(in srgb,var(--mint) 6%,transparent);border:1px solid color-mix(in srgb,var(--mint) 18%,transparent)">
+        <div class="d-flex flex-column gap-2">
+          <input id="taskText" type="text" class="settings-input" placeholder="Текст задачи…" maxlength="200">
+          <select id="taskAssignee" class="settings-select">
+            <option value="">— Для всех сотрудников —</option>
+          </select>
+          <div class="d-flex gap-2">
+            <button class="btn btn-sm btn-success flex-grow-1" type="button" id="taskSaveBtn">
+              <i class="bi bi-check me-1"></i> Сохранить
+            </button>
+            <button class="btn btn-sm btn-outline-secondary" type="button" id="taskCancelBtn">Отмена</button>
+          </div>
+          <div id="taskErr" class="text-danger small d-none"></div>
+        </div>
+      </div>
+      <div id="tasksList" class="d-flex flex-column gap-2"><div class="text-muted small">Загрузка…</div></div>
+    </div>
+  </div>
+
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+  window.__ADMIN_PAGE__ = "desktop";
+  window.__USER_ROLE__  = "{{ role }}";
+  window.__USER_PHONE__ = "{{ current_user.phone if current_user else '' }}";
+</script>
+{% endblock %}

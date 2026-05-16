@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv*/ 
+*.log
+
+# DB / local artifacts
+*.db
+*.sqlite*
+*.bak
+*.rar
+
+# Dependencies
+node_modules/
+
+# Nested repository metadata backups
+.git-backup*/
+
+# env
+.env
+.env.*
+!.env.example
